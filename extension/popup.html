@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+  <title>Notion → Magpie · 连接说明</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { width: 360px; margin: 0; background: #fff; color: #242422; font: 13px/1.65 system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+    main { padding: 22px; }
+    header { display: flex; align-items: center; gap: 11px; margin-bottom: 20px; }
+    header img { width: 32px; height: 32px; flex: none; }
+    h1 { margin: 0; font-size: 17px; font-weight: 650; line-height: 1.4; }
+    .subtitle { margin: 2px 0 0; color: #787872; font-size: 12px; }
+    ol { list-style: none; padding: 0; margin: 0; counter-reset: step; }
+    li { position: relative; padding: 0 0 17px 34px; counter-increment: step; }
+    li::before { content: counter(step); position: absolute; top: 1px; left: 0; width: 22px; height: 22px; border: 1px solid #dfdfda; border-radius: 6px; text-align: center; font-size: 12px; line-height: 20px; font-weight: 600; }
+    li:last-child { padding-bottom: 0; }
+    h2 { margin: 0 0 4px; font-size: 13px; font-weight: 650; }
+    p { margin: 0; color: #62625c; }
+    .path { color: #343430; }
+    a { display: inline-block; margin-top: 8px; color: #242422; font-size: 12px; text-decoration: none; border: 1px solid #dfdfda; border-radius: 6px; padding: 5px 9px; background: #fafaf8; }
+    a:hover { background: #eeeeea; }
+    a:focus-visible { outline: 2px solid #242422; outline-offset: 3px; }
+    .hint { margin-top: 18px; padding: 10px 12px; border: 1px solid #e8e8e3; border-radius: 8px; background: #f8f8f5; font-size: 12px; }
+    footer { margin-top: 14px; padding-top: 12px; border-top: 1px solid #ecece8; color: #85857e; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <img src="icons/32.png" alt="Notion" width="32" height="32">
+      <div><h1>Notion → Magpie</h1><p class="subtitle">从 Magpie 发起账号连接</p></div>
+    </header>
+    <ol>
+      <li>
+        <h2>打开连接页</h2>
+        <p>在 Magpie 中依次选择：</p>
+        <p class="path">Notion → 添加账号 → 浏览器登录</p>
+      </li>
+      <li>
+        <h2>登录目标账号</h2>
+        <p>在当前浏览器中登录或切换到要使用的 Notion 账号，再回到连接页点击“连接账号”。</p>
+        <a href="https://app.notion.com/login" target="_blank" rel="noopener noreferrer">打开 Notion 登录 ↗</a>
+      </li>
+      <li>
+        <h2>确认工作区</h2>
+        <p>核对邮箱、选择工作区，再点击确认，将账号连接到 Magpie。</p>
+      </li>
+    </ol>
+    <p class="hint">连接页超时后，请从 Magpie 重新发起登录。</p>
+    <footer>此图标仅提供使用说明，不会主动读取登录会话。</footer>
+  </main>
+</body>
+</html>
