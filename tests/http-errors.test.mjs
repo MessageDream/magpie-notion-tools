@@ -124,10 +124,7 @@ test("safe HTTP diagnostics survive JSON and SSE client responses", async () => 
     assert.match(output, /payment_reason_unknown/)
     assert.match(output, /listenToThreadTranscript.*HTTP 402/)
     assert.doesNotMatch(output, /DO-NOT-LEAK|\[DONE\]|"finish_reason":"stop"/)
-    if (stream) {
-      assert.equal(response.status, 200)
-      assert.match(response.headers.get("Content-Type"), /text\/event-stream/)
-      assert.match(output, /data: \{"error"/)
-    } else assert.equal(response.status, 402)
+    assert.equal(response.status, 402)
+    assert.match(response.headers.get("Content-Type"), /application\/json/)
   }
 })

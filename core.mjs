@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto"
+import { createHash, randomUUID } from "node:crypto"
 import { BridgeError, prepareChatTools, parseToolReply } from "./tools.mjs"
 
 const ID = "notion"
@@ -12,22 +12,79 @@ export class ProviderError extends Error {
     this.code = code
     if (status === 401) this.signIn = "expired"
     if (options.retryAfter !== undefined) this.retryAfter = String(options.retryAfter)
+    if (options.retryable !== undefined) this.retryable = options.retryable
+    if (options.submitted !== undefined) this.submitted = options.submitted
   }
 }
 
 function publicError(error) {
-  if (error instanceof ProviderError || error instanceof BridgeError) return { message: error.message, type: "notion_error", code: error.code }
+  if (submittedTerminal(error)) return { message: "Notion cannot safely continue this turn. Automatic generation has stopped.", type: "notion_error", code: error.code, retryable: false }
+  if (error instanceof ProviderError || error instanceof BridgeError) return { message: error.message, type: "notion_error", code: error.code, ...(error.retryable === false ? { retryable: false } : {}) }
   return { message: "Notion AI request failed. No upstream diagnostic or session data was included.", type: "notion_error", code: "upstream_error" }
+}
+
+function submittedTerminal(error) {
+  return error?.retryable === false && ![401, 402, 403, 429].includes(error.status)
 }
 
 function errorResponse(error) {
   const headers = {}
   if (error?.signIn === "expired") headers["X-Magpie-Sign-In"] = "expired"
   if (error?.retryAfter !== undefined) headers["Retry-After"] = error.retryAfter
+  if (error?.retryable === false) headers["X-Should-Retry"] = "false"
   return Response.json({ error: publicError(error) }, {
-    status: error instanceof ProviderError || error instanceof BridgeError ? error.status : 502,
+    // Magpie does not retry this fixed 422, and client SDKs need not retry it
+    // either. Its error path may discard X-Should-Retry, so do not rely on it.
+    status: submittedTerminal(error) ? 422 : error instanceof ProviderError || error instanceof BridgeError ? error.status : 502,
     ...(Object.keys(headers).length ? { headers } : {}),
   })
+}
+
+// Once a turn has been submitted, a broken reply must not ask a gateway to
+// generate it again. The protocol also remembers this outcome for replays.
+function submittedFailure(error) {
+  if (error instanceof ProviderError && error.retryable === false) return error
+  const known = error instanceof ProviderError || error instanceof BridgeError
+  if (error instanceof ProviderError && [401, 402, 403, 429].includes(error.status)) return new ProviderError(error.status, error.code, error.message, { retryable: false, submitted: true })
+  return new ProviderError(409, known ? error.code : "response_unusable", known ? error.message : "The submitted Notion turn could not be delivered. It will not be generated again automatically.", { retryable: false, submitted: true })
+}
+
+async function acceptReply(events, completion) {
+  const choice = completion.choices[0]
+  const accepted = await events.accept?.(choice.message)
+  if (accepted) {
+    choice.message = accepted
+    choice.finish_reason = accepted.tool_calls?.length ? "tool_calls" : choice.finish_reason === "tool_calls" ? "stop" : choice.finish_reason
+  }
+}
+
+async function* savedCompletionChunks(completion) {
+  const { id, created, model } = completion
+  const { message, finish_reason } = completion.choices[0]
+  const chunk = (delta, reason = null) => ({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: reason }] })
+  yield chunk({ role: "assistant", content: "" })
+  if (message.content) yield chunk({ content: message.content })
+  if (message.tool_calls?.length) yield chunk({ tool_calls: message.tool_calls.map((call, index) => ({ index, ...call })) })
+  yield chunk({}, finish_reason)
+}
+
+async function firstEvent(events) {
+  const iterator = events[Symbol.asyncIterator]()
+  const first = await iterator.next()
+  let pending = true
+  // A generator which has not started does not run its finally on return().
+  // Forward return directly so cancelling before the role chunk still closes
+  // the already-prefetched upstream iterator.
+  return {
+    [Symbol.asyncIterator]() { return this },
+    next() {
+      if (pending) { pending = false; return Promise.resolve(first) }
+      return first.done ? Promise.resolve(first) : iterator.next()
+    },
+    return(value) { return iterator.return?.(value) ?? Promise.resolve({ done: true, value }) },
+    accept: events.accept?.bind(events),
+    reject: events.reject?.bind(events),
+  }
 }
 
 function text(content) {
@@ -91,11 +148,14 @@ async function* completionChunks(events, model, signal, context) {
     return
   }
   try {
+    let content = ""
     for await (const event of events) {
       signal.throwIfAborted()
       if (event?.type === "text" && typeof event.text === "string") {
+        content += event.text
         if (event.text) yield chunk({ content: event.text })
       } else if (event?.type === "done" && ["stop", "length", "content_filter"].includes(event.finishReason ?? "stop")) {
+        await events.accept?.({ role: "assistant", content: typeof event.text === "string" ? event.text : content })
         yield chunk({}, event.finishReason ?? "stop")
         return
       } else {
@@ -103,13 +163,16 @@ async function* completionChunks(events, model, signal, context) {
       }
     }
   } catch (error) {
-    if (signal.aborted) throw signal.reason
-    throw error
+    const failure = submittedFailure(signal.aborted ? signal.reason : error)
+    await events.reject?.(failure)
+    throw failure
   }
-  throw new ProviderError(502, "incomplete_upstream", "Notion AI ended the response without a verified completion event.")
+  const failure = submittedFailure(new ProviderError(502, "incomplete_upstream", "Notion AI ended the response without a verified completion event."))
+  await events.reject?.(failure)
+  throw failure
 }
 
-function streamResponse(chunks, cancel) {
+function streamResponse(chunks, cancel, onCancel) {
   const iterator = chunks[Symbol.asyncIterator]()
   const frame = (value) => encoder.encode("data: " + (typeof value === "string" ? value : JSON.stringify(value)) + "\n\n")
   let ended = false
@@ -136,7 +199,7 @@ function streamResponse(chunks, cancel) {
     async cancel(reason) {
       ended = true
       cancel(reason)
-      await iterator.return?.()
+      try { await iterator.return?.() } finally { await onCancel?.(reason) }
     },
   }), { headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" } })
 }
@@ -166,6 +229,9 @@ async function bufferedResponse(events, model, signal, context) {
   const choice = context?.enabled
     ? parseToolReply(content, context, finishReason)
     : { message: { role: "assistant", content }, finish_reason: finishReason }
+  if (!choice.message.tool_calls?.length && !choice.message.content?.trim()) {
+    throw new ProviderError(409, "empty_answer", "Notion completed this turn without a usable answer or tool call.", { retryable: false, submitted: true })
+  }
   return Response.json({ id, object: "chat.completion", created, model, choices: [{ index: 0, ...choice }] })
 }
 
@@ -189,7 +255,7 @@ export function createPlugin(protocol, options = {}) {
     async config(config) {
       config.provider ??= {}
       config.provider[ID] ??= {
-        name: "Notion AI（工具调用）",
+        name: "Notion AI",
         npm: "@ai-sdk/openai-compatible",
         api: VIRTUAL_API,
         models: { "omniberry-sundae": { name: "Notion AI（登录后刷新模型列表）", tool_call: true, attachment: false, modalities: { input: ["text"], output: ["text"] } } },
@@ -211,6 +277,7 @@ export function createPlugin(protocol, options = {}) {
           apiKey: "notion-local-adapter",
           async fetch(input, init = {}) {
             let scope
+            let events
             try {
               const request = new Request(input, init)
               const url = new URL(request.url)
@@ -221,15 +288,40 @@ export function createPlugin(protocol, options = {}) {
               try { body = await request.json() } catch { throw new ProviderError(400, "invalid_json", "Expected a JSON chat request.") }
               const validated = parseChat(body)
               const { chat: prepared, context } = prepareChatTools(body)
+              if (!context.enabled && body.messages.some(message => message.role === "tool" || message.tool_calls?.length)) {
+                throw new ProviderError(409, "tool_catalog_required", "Continue tool history with the same tool catalog and tool_choice none when no more calls are needed.", { retryable: false })
+              }
               const chat = { ...validated, messages: prepared.messages, toolBridge: context.enabled, bufferedResponse: context.enabled || !validated.stream }
+              if (context.enabled) {
+                chat.clientMessages = structuredClone(body.messages)
+                chat.bridgeContextKey = createHash("sha256").update(context.catalogKey).digest("hex")
+                chat.bridgePolicy = context.policy
+              }
               scope = scopedSignal(request.signal, timeoutMs)
               scope.signal.throwIfAborted()
               const auth = await getAuth()
-              const events = await protocol.open({ auth, chat, signal: scope.signal })
-              if (chat.stream) return streamResponse(completionChunks(events, chat.model, scope.signal, context), scope.close)
-              try { return await bufferedResponse(events, chat.model, scope.signal, context) } finally { scope.close() }
+              events = await protocol.open({ auth, chat, signal: scope.signal })
+              if (context.enabled || !chat.stream) {
+                const completion = await (await bufferedResponse(events, chat.model, scope.signal, context)).json()
+                await acceptReply(events, completion)
+                if (chat.stream) return streamResponse(savedCompletionChunks(completion), scope.close)
+                scope.close()
+                return Response.json(completion)
+              }
+              // Find an upstream event before sending HTTP 200. A completed
+              // empty turn can then be returned as a non-retryable HTTP error.
+              events = await firstEvent(events)
+              return streamResponse(completionChunks(events, chat.model, scope.signal, context), scope.close, async () => {
+                await events.reject?.(submittedFailure(scope.signal.reason))
+                await events.return?.()
+              })
             } catch (error) {
               if (scope?.signal.aborted && scope.signal.reason instanceof ProviderError) error = scope.signal.reason
+              if (events) {
+                error = submittedFailure(error)
+                await events.reject?.(error)
+                await events.return?.()
+              }
               scope?.close()
               return errorResponse(error)
             }

@@ -2,12 +2,16 @@ import { createHash, randomUUID } from "node:crypto"
 import { ProviderError } from "./core.mjs"
 import { readNDJSON, transcriptEvents, sessionError } from "./transcript.mjs"
 import { readFailurePayload, httpFailure } from "./http-errors.mjs"
+import { formatToolPlanner } from "./tools.mjs"
 
 const ORIGIN = "https://app.notion.com"
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
 const sessions = new Map()
+const submissions = new Map()
 const catalogs = new Map()
 const TTL = 30 * 60 * 1000
+const MAX_REPLAY_BYTES = 1024 * 1024
+const MAX_TOTAL_REPLAY_BYTES = 8 * 1024 * 1024
 const digest = (value) => createHash("sha256").update(JSON.stringify(value)).digest("hex")
 const moduleFetch = globalThis.fetch
 const CONTROL = /[\x00-\x1f\x7f]/
@@ -91,16 +95,11 @@ async function request(name, url, init) {
   // cannot silently change their transport.
   if (name !== "createAgentThread") return moduleFetch(url, init)
   const client = await impit()
-  try {
-    return await client.fetch(url, init)
-  } catch (error) {
-    // Some impit builds reject the request-level redirect option. The shared
-    // client still refuses to follow redirects, so omitting it is safe: a 3xx
-    // response reaches call() and becomes an error there.
-    if (!/redirect/i.test(String(error?.message ?? ""))) throw error
-    const { redirect, ...withoutRedirect } = init
-    return client.fetch(url, withoutRedirect)
-  }
+  // The shared client already refuses redirects. Omit the unsupported
+  // request-level option on the first write instead of retrying a POST after
+  // a transport exception that may have followed a successful submission.
+  const { redirect, ...withoutRedirect } = init
+  return client.fetch(url, withoutRedirect)
 }
 
 function useFetch(fetch) {
@@ -333,7 +332,10 @@ async function catalog(account, signal, refresh = false) {
 // plan and the workspace don't serve — and keeps it for the next minute.
 function keepModels(key, response) {
   if (!Array.isArray(response.models)) throw new ProviderError(502, "invalid_model_catalog", "Notion AI returned an unsupported model catalog.")
-  const models = response.modelSelectionRestricted || response.restrictedGeoHiddenModelModes?.includes("agent_service") ? [] : response.models.filter(eligible)
+  const available = response.modelSelectionRestricted || response.restrictedGeoHiddenModelModes?.includes("agent_service") ? [] : response.models.filter(eligible)
+  // Auto is the web client's unpinned personal-agent mode, not an upstream
+  // model ID. Only offer it alongside a readable, eligible personal catalog.
+  const models = available.length ? [{ model: "auto", modelMessage: "Notion Auto", agentService: {} }, ...available.filter((entry) => entry.model !== "auto")] : []
   while (catalogs.size >= 256) catalogs.delete(catalogs.keys().next().value)
   catalogs.set(key, { models, at: Date.now() })
   return models
@@ -392,6 +394,81 @@ function forget(key) {
 function remember(key, threadId, sequence) {
   while (sessions.size >= 256) sessions.delete(sessions.keys().next().value)
   sessions.set(key, { threadId, sequence, at: Date.now() })
+}
+
+// Cache the history the client actually received, including generated tool IDs,
+// rather than the model's JSON envelope. Formatting differences in equivalent
+// client messages must not force another paid thread.
+function stable(value) {
+  return JSON.stringify(value, (_key, item) => item && typeof item === "object" && !Array.isArray(item)
+    ? Object.fromEntries(Object.keys(item).sort().map((key) => [key, item[key]])) : item)
+}
+
+function clientText(value) {
+  if (Array.isArray(value)) return value.map((part) => part.text ?? "").join("")
+  return value == null ? "" : typeof value === "string" ? value : stable(value)
+}
+
+function clientHistory(messages) {
+  return messages.map((message) => ({
+    role: message.role,
+    content: clientText(message.content),
+    ...(message.role === "tool" ? { tool_call_id: message.tool_call_id } : {}),
+    ...(message.tool_calls?.length ? { tool_calls: message.tool_calls.map((call) => {
+      let args = call.function?.arguments
+      try { args = typeof args === "string" ? JSON.parse(args) : args } catch { /* Already validated by the client adapter. */ }
+      return { id: call.id, name: call.function?.name, arguments: args }
+    }) } : {}),
+  }))
+}
+
+function continuationError(code, message) {
+  return new ProviderError(409, code, message, { retryable: false })
+}
+
+function submittedError(error) {
+  if (error instanceof ProviderError) {
+    error.retryable = false
+    error.submitted = true
+    return error
+  }
+  return new ProviderError(409, "generation_unconfirmed", "Notion AI may already have generated this turn. Automatic resubmission was stopped.", { retryable: false, submitted: true })
+}
+
+function requestRecord(key) {
+  for (const [id, record] of submissions) {
+    if (record.state !== "pending" && Date.now() - record.at > TTL) submissions.delete(id)
+  }
+  return submissions.get(key)
+}
+
+function reserveRequest(key) {
+  const previous = requestRecord(key)
+  if (previous) throw continuationError("generation_already_submitted", "This Notion AI turn was already submitted. Automatic resubmission was stopped.")
+  if (submissions.size >= 256) throw continuationError("generation_guard_full", "The Notion AI request guard is full. Wait before starting more turns.")
+  const record = { state: "pending", at: Date.now() }
+  submissions.set(key, record)
+  return record
+}
+
+function incrementalText(history, start, policy, planner = false) {
+  const bindings = new Map(history.slice(0, start).flatMap((message) => (message.tool_calls ?? []).map((call, index) => [call.id, { name: call.function?.name, call_index: index }])))
+  const added = history.slice(start)
+  if (!added.length || added.some((message) => !["user", "tool"].includes(message.role))) {
+    throw continuationError("client_history_changed", "The client history no longer continues the saved Notion AI thread. Start a new conversation explicitly.")
+  }
+  const parts = []
+  const results = []
+  for (const message of added) {
+    if (message.role === "tool") results.push({ tool_call_id: message.tool_call_id, ...bindings.get(message.tool_call_id), content: clientText(message.content) })
+    else {
+      if (results.length) { parts.push({ tool_results: results.splice(0) }) }
+      parts.push(clientText(message.content))
+    }
+  }
+  if (results.length) parts.push({ tool_results: results })
+  if (planner) return formatToolPlanner({ delta: parts, policy })
+  return [...(policy === undefined ? [] : ["Client tool policy for this turn: " + stable(policy)]), ...parts.map((part) => typeof part === "string" ? part : stable(part))].join("\n\n")
 }
 
 // ---- quota -----------------------------------------------------------------
@@ -531,89 +608,162 @@ export default {
     const models = await catalog(account, signal)
     const model = models.find((entry) => entry.model === chat.model)
     if (!model) throw new ProviderError(403, "model_unavailable", "This Notion workspace does not offer the requested model for personal agents. Refresh the model list after signing in.")
-    const effort = chat.reasoning_effort ?? model.modelConfiguration?.defaultReasoningEffort
+    const auto = chat.model === "auto"
+    const effort = auto ? undefined : chat.reasoning_effort ?? model.modelConfiguration?.defaultReasoningEffort
     if (effort !== undefined && !model.modelConfiguration?.supportedReasoningEfforts?.includes(effort)) {
       throw new ProviderError(400, "reasoning_effort_unavailable", "The requested reasoning effort is not offered for this Notion model.")
     }
     const last = chat.messages.at(-1)
     if (last.role !== "user") throw new ProviderError(400, "user_message_required", "The conversation must end with a user message.")
-    const accountId = digest([account.cookie, account.spaceId, account.activeUserId, chat.model, effort])
-    const historyKey = (messages) => digest([accountId, messages])
-    const previousKey = historyKey(chat.messages.slice(0, -1))
-    // Tool envelopes become client-visible calls with generated IDs. Their
-    // normalized history differs from the raw Notion reply, so start a fresh
-    // thread with complete history rather than incorrectly resuming one.
-    let previous = chat.toolBridge ? undefined : take(previousKey)
+    const history = chat.clientMessages ?? chat.messages
+    const accountId = digest([account.cookie, account.spaceId, account.activeUserId, chat.model, effort, chat.bridgeContextKey])
+    const historyKey = (messages) => digest([accountId, stable(clientHistory(messages))])
+    const requestKey = digest([historyKey(history), stable(chat.bridgePolicy)])
+    const replay = requestRecord(requestKey)
+    if (replay) {
+      if (replay.state !== "completed" || !replay.completed || !replay.message) {
+        throw new ProviderError(409, "generation_already_submitted", "This Notion AI turn was already submitted. Automatic resubmission was stopped.", { retryable: false, submitted: true })
+      }
+      const events = (async function* () {
+        if (replay.completed.text) yield { type: "text", text: replay.completed.text }
+        yield structuredClone(replay.completed)
+      })()
+      events.accept = () => structuredClone(replay.message)
+      events.reject = () => {}
+      return events
+    }
+    let previousKey
+    let previous
+    let prefixLength = 0
+    for (let length = history.length - 1; length > 0; length--) {
+      if (history[length - 1]?.role !== "assistant") continue
+      const key = historyKey(history.slice(0, length))
+      if (sessions.has(key) && claims.has(key)) throw continuationError("thread_busy", "The saved Notion AI thread already has a turn in flight. Automatic branching was stopped.")
+      const value = take(key)
+      if (value) { previousKey = key; previous = value; prefixLength = length; break }
+    }
+    if (!previous && chat.toolBridge && history.some((message) => ["assistant", "tool"].includes(message.role))) {
+      throw continuationError("thread_history_missing", "The Notion AI tool thread is no longer available. Start a new conversation explicitly; the full history was not resent.")
+    }
     let claimedKey = previous ? previousKey : undefined
     let afterSequence = 0
-    if (previous) {
-      try {
-        const before = await json("getThreadTranscript", { spaceId: account.spaceId, threadId: previous.threadId, direction: "backward", limit: 10 }, account, signal)
-        // If the user advanced this thread in Notion, the client's history is
-        // no longer its history. Start a new thread instead of mixing them.
-        if (before.session?.sequence !== previous.sequence) {
-          forget(previousKey)
-          claimedKey = undefined
-          previous = undefined
-        } else if (before.session?.status !== "idle") {
-          release(previousKey)
-          claimedKey = undefined
-          previous = undefined
-        } else {
-          afterSequence = previous.sequence
-          await json("sendEventToAgentThread", { spaceId: account.spaceId, threadId: previous.threadId, event: { type: "user.message", content: content(last.content) }, surface: "full_page_chat", clientEventId: randomUUID() }, account, signal)
-          forget(previousKey)
-          claimedKey = undefined
-        }
-      } catch (error) {
-        if (claimedKey) release(claimedKey)
-        throw error
-      }
-    }
+    let record
     let threadId
-    if (previous) {
-      threadId = previous.threadId
-    } else {
-      threadId = randomUUID()
-      const created = await json("createAgentThread", {
-        type: "personal_agent", spaceId: account.spaceId, threadId,
-        model: chat.model, ...(effort !== undefined ? { reasoningEffort: effort } : {}),
-        createdSource: "full_page_chat", content: content(initialText(chat.messages)),
-        policies: { approval_mode: "ask", disable_internet_access: true, disable_computer_file_downloads: true },
-        agentMemorySettings: { useMemories: false, excludeChatFromMemories: true },
-        browserEnabled: false, clientMessageId: randomUUID(),
-      }, account, signal)
-      if (typeof created.threadId !== "string" || !UUID.test(created.threadId)) throw new ProviderError(502, "unexpected_thread", "Notion AI returned an invalid thread id.")
-      threadId = created.threadId
-    }
-    const pages = await transcriptPages(account, threadId, afterSequence, signal)
-    const newest = pages.at(-1)
-    const page = pages.length === 1 ? newest : { ...newest, patches: pages.flatMap((entry) => entry.patches) }
-    if (afterSequence === 0 || page.session?.sequence > afterSequence || page.session?.last_turn_allowance?.sequence > afterSequence) sessionError(page.session)
-    const completedOnPage = page.patches.some((patch) => patch.op === "put" && patch.entity?.kind === "turn_completed" && patch.entity.sequence > afterSequence)
     let liveResponse
-    if (!completedOnPage) {
-      if (typeof page.forward_cursor !== "string") throw new ProviderError(502, "missing_cursor", "Notion AI did not return a transcript cursor.")
-      // Establish the HTTP stream before returning client headers, so an
-      // expired session at this endpoint can still be reported as HTTP 401.
-      liveResponse = await call("listenToThreadTranscript", { spaceId: account.spaceId, threadId, cursor: page.forward_cursor, includeProvisionalUserMessages: true, includeQueueChanges: false }, account, signal)
-    }
-    async function* frames() {
-      yield page
-      if (liveResponse) yield* readNDJSON(liveResponse.body, signal)
-    }
-    return (async function* () {
-      let answer = ""
-      try {
-        for await (const event of transcriptEvents(frames(), signal, { afterSequence, buffered: chat.bufferedResponse })) {
-          if (event.type === "text") answer += event.text
-          else if (event.type === "done" && !chat.toolBridge) remember(historyKey([...chat.messages, { role: "assistant", content: event.text ?? answer }]), threadId, event.sequence)
-          yield event
+    try {
+      if (previous) {
+        try {
+          const before = await json("getThreadTranscript", { spaceId: account.spaceId, threadId: previous.threadId, direction: "backward", limit: 10 }, account, signal)
+          if (before.session?.sequence !== previous.sequence) {
+            forget(previousKey)
+            claimedKey = undefined
+            throw continuationError("thread_history_changed", "The saved Notion AI thread changed outside this client. Automatic recreation was stopped.")
+          } else if (before.session?.status !== "idle") {
+            throw continuationError("thread_busy", "The saved Notion AI thread is not idle. Automatic recreation was stopped.")
+          } else {
+            const delta = incrementalText(history, prefixLength, chat.bridgePolicy, auto && chat.toolBridge)
+            afterSequence = previous.sequence
+            record = reserveRequest(requestKey)
+            // Once a write may have reached Notion, this prefix cannot be used to
+            // submit it again, even if its HTTP response is lost.
+            forget(previousKey)
+            claimedKey = undefined
+            await json("sendEventToAgentThread", { spaceId: account.spaceId, threadId: previous.threadId, event: { type: "user.message", content: content(delta) }, surface: "full_page_chat", clientEventId: randomUUID() }, account, signal)
+          }
+        } catch (error) {
+          if (claimedKey) release(claimedKey)
+          throw error
         }
-      } finally { await liveResponse?.body?.cancel().catch(() => {}) }
-    })()
+      }
+      if (previous) {
+        threadId = previous.threadId
+      } else {
+        threadId = randomUUID()
+        record = reserveRequest(requestKey)
+        const created = await json("createAgentThread", {
+          type: "personal_agent", spaceId: account.spaceId, threadId,
+          ...(!auto ? { model: chat.model } : {}), ...(effort !== undefined ? { reasoningEffort: effort } : {}),
+          createdSource: "full_page_chat", content: content(initialText(chat.messages)),
+          policies: { approval_mode: "ask", disable_internet_access: true, disable_computer_file_downloads: true },
+          agentMemorySettings: { useMemories: false, excludeChatFromMemories: true },
+          browserEnabled: false, clientMessageId: randomUUID(),
+        }, account, signal)
+        if (typeof created.threadId !== "string" || !UUID.test(created.threadId)) throw new ProviderError(502, "unexpected_thread", "Notion AI returned an invalid thread id.")
+        threadId = created.threadId
+      }
+      const pages = await transcriptPages(account, threadId, afterSequence, signal)
+      const newest = pages.at(-1)
+      const page = pages.length === 1 ? newest : { ...newest, patches: pages.flatMap((entry) => entry.patches) }
+      if (afterSequence === 0 || page.session?.sequence > afterSequence || page.session?.last_turn_allowance?.sequence > afterSequence) sessionError(page.session)
+      const completedOnPage = page.patches.some((patch) => patch.op === "put" && patch.entity?.kind === "turn_completed" && patch.entity.sequence > afterSequence)
+      if (!completedOnPage) {
+        if (typeof page.forward_cursor !== "string") throw new ProviderError(502, "missing_cursor", "Notion AI did not return a transcript cursor.")
+        // Establish the HTTP stream before returning client headers, so an
+        // expired session at this endpoint can still be reported as HTTP 401.
+        liveResponse = await call("listenToThreadTranscript", { spaceId: account.spaceId, threadId, cursor: page.forward_cursor, includeProvisionalUserMessages: true, includeQueueChanges: false }, account, signal)
+      }
+      async function* frames() {
+        yield page
+        if (liveResponse) yield* readNDJSON(liveResponse.body, signal)
+      }
+      const events = (async function* () {
+        let answer = ""
+        try {
+          for await (const event of transcriptEvents(frames(), signal, { afterSequence, buffered: chat.bufferedResponse })) {
+            if (event.type === "text") answer += event.text
+            else if (event.type === "done") {
+              record.completed = { ...event, text: event.text ?? answer }
+              // Direct protocol users keep the plain-text contract. The client
+              // adapter commits only after validating its final tool envelope.
+              if (!chat.clientMessages && !chat.toolBridge) events.accept({ role: "assistant", content: record.completed.text })
+            }
+            yield event
+          }
+        } catch (error) {
+          events.reject(error)
+          throw submittedError(error)
+        } finally {
+          await liveResponse?.body?.cancel().catch(() => {})
+          if (!record.completed && record.state === "pending") events.reject(signal?.reason)
+        }
+      })()
+      events.accept = (message) => {
+        if (record.state === "completed") return structuredClone(record.message ?? message)
+        if (record.state !== "pending" || !record.completed) throw continuationError("generation_unconfirmed", "The Notion AI turn has not been verified and cannot be continued.")
+        record.state = "completed"
+        record.at = Date.now()
+        remember(historyKey([...history, message]), threadId, record.completed.sequence)
+        // Keep duplicate replay bounded. A larger answer retains only its
+        // submission tombstone; it may be continued but never regenerated.
+        const bytes = Buffer.byteLength(stable([record.completed, message]))
+        const retainedBytes = [...submissions.values()].reduce((sum, entry) => sum + (entry.bytes ?? 0), 0)
+        if (bytes <= MAX_REPLAY_BYTES && retainedBytes + bytes <= MAX_TOTAL_REPLAY_BYTES) {
+          record.message = structuredClone(message)
+          record.bytes = bytes
+        } else record.completed = undefined
+        return message
+      }
+      events.reject = (error) => {
+        if (record.state !== "pending") return
+        record.state = "failed"
+        record.at = Date.now()
+        record.completed = undefined
+        record.error = submittedError(error)
+      }
+      return events
+    } catch (error) {
+      if (claimedKey) release(claimedKey)
+      await liveResponse?.body?.cancel().catch(() => {})
+      if (record) {
+        record.state = "failed"
+        record.at = Date.now()
+        record.error = submittedError(error)
+        throw record.error
+      }
+      throw error
+    }
   },
   usage: quota,
 }
 
-export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows, useFetch }
+export const _internal = { cookie, credentials, accountOf, workspace, resolved, RESOLVED_TTL, keepModels, initialText, content, sessions, submissions, catalogs, eligible, modelEntry, percent, rollingWindow, billingWindow, quotaWindows, useFetch }

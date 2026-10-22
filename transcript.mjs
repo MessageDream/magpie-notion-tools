@@ -4,6 +4,12 @@ function invalid() {
   return new ProviderError(502, "invalid_transcript", "Notion AI returned an unsupported transcript update.")
 }
 
+// A completed upstream turn must not become a retryable gateway failure:
+// starting another turn could spend credits again without recovering this one.
+function completedFailure(code, message) {
+  return new ProviderError(409, code, message, { retryable: false, submitted: true })
+}
+
 function messageText(entity) {
   if (!Array.isArray(entity.content)) throw invalid()
   return entity.content.filter((part) => part?.type === "text").map((part) => {
@@ -173,12 +179,12 @@ export async function* transcriptEvents(frames, signal, { afterSequence = 0, buf
       aligned = false
     }
     if (completed) {
-      if (completed.stop_reason === "requires_action") throw new ProviderError(409, "notion_action_required", "The Notion agent requires approval or input in the Notion client.")
-      if (["runtime_error", "retries_exhausted"].includes(completed.stop_reason)) throw new ProviderError(502, "notion_agent_error", "The Notion agent could not complete this turn.")
+      if (completed.stop_reason === "requires_action") throw completedFailure("notion_action_required", "The Notion agent requires approval or input in the Notion client.")
+      if (["runtime_error", "retries_exhausted"].includes(completed.stop_reason)) throw completedFailure("notion_agent_error", "The Notion agent ended this submitted turn with an error. Automatic regeneration is disabled.")
       if (completed.stop_reason !== "end_turn") {
-        throw new ProviderError(502, "unsupported_stop_reason", "Notion AI ended with an unverified stop reason.")
+        throw completedFailure("unsupported_stop_reason", "Notion AI ended with an unverified stop reason. Automatic regeneration is disabled.")
       }
-      if (!visible) throw new ProviderError(502, "empty_answer", "Notion AI completed the turn without any text to send.")
+      if (!visible.trim()) throw completedFailure("empty_answer", "Notion AI completed this turn without readable text. It may already have used credits; automatic regeneration is disabled. Inspect the existing turn in Notion before continuing.")
       if (buffered) yield { type: "text", text: visible }
       // Buffered clients receive only the authoritative final transcript.
       yield { type: "done", finishReason: "stop", sequence: completed.sequence, text: visible }

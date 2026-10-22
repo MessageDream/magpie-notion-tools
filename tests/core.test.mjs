@@ -15,6 +15,14 @@ test("advertises tools when an existing Notion provider configured text-only mod
   assert.equal(config.provider.notion.name, "My Notion")
 })
 
+test("an existing Auto model advertises the client tool bridge when configuration is refreshed", async () => {
+  const { plugin } = await adapter([])
+  const config = { provider: { notion: { models: { auto: { tool_call: true }, manual: { tool_call: false } } } } }
+  await plugin.config(config)
+  assert.equal(config.provider.notion.models.auto.tool_call, true)
+  assert.equal(config.provider.notion.models.manual.tool_call, true)
+})
+
 async function adapter(replies, options) {
   const observed = []
   const auth = { type: "api", key: "synthetic-test-only" }
@@ -100,14 +108,15 @@ test("malformed tools fail before model access; invalid model output cannot call
   assert.equal(badInput.status, 400)
   assert.equal(observed.length, 0)
   const badOutput = await send(body())
-  assert.equal(badOutput.status, 502)
+  assert.equal(badOutput.status, 422)
+  assert.equal(badOutput.headers.get("X-Should-Retry"), "false")
   assert.equal((await badOutput.json()).error.code, "invalid_tool_call")
 })
 
 test("unfinished transcripts fail without inventing a successful response", async () => {
   const { send } = await adapter([async function* () { yield { type: "text", text: toolReply } }])
   const response = await send(body())
-  assert.equal(response.status, 502)
+  assert.equal(response.status, 422)
   assert.equal((await response.json()).error.code, "incomplete_upstream")
 })
 
@@ -128,13 +137,113 @@ test("auth expiration, quota and transport errors remain safe and accurate", asy
   assert.doesNotMatch(await transport.text(), /DO-NOT-LEAK/)
 })
 
-test("invalid SSE tool output reports an error and never a successful tool delta", async () => {
+test("invalid streamed tool output is rejected before HTTP success headers", async () => {
   const { send } = await adapter(["not a JSON envelope"])
-  const output = await (await send(body({ stream: true }))).text()
+  const response = await send(body({ stream: true }))
+  assert.equal(response.status, 422)
+  assert.match(response.headers.get("Content-Type"), /application\/json/)
+  assert.equal(response.headers.get("X-Should-Retry"), "false")
+  const output = await response.text()
   assert.match(output, /"error"/)
   assert.match(output, /invalid_tool_reply/)
   assert.doesNotMatch(output, /"tool_calls":\[/)
   assert.doesNotMatch(output, /\[DONE\]/)
+})
+
+test("a completed empty plain stream returns a terminal HTTP error before 200", async () => {
+  const { send } = await adapter([async function* () {
+    throw new ProviderError(409, "empty_answer", "Synthetic completed empty answer", { submitted: true, retryable: false })
+  }])
+  const response = await send(body({ tools: [], stream: true }))
+  assert.equal(response.status, 422)
+  assert.equal((await response.json()).error.code, "empty_answer")
+  assert.equal(response.headers.get("X-Should-Retry"), "false")
+})
+
+test("accepted tool IDs and failed parsing are committed to the protocol exactly once", async () => {
+  const accepted = [], rejected = []
+  let bad = false
+  const plugin = createPlugin({
+    async open() {
+      const events = (async function* () {
+        yield { type: "done", text: bad ? "invalid JSON" : toolReply, sequence: 2, finishReason: "stop" }
+      })()
+      events.accept = async message => { accepted.push(message); return message }
+      events.reject = async error => rejected.push(error)
+      return events
+    },
+  })
+  const loader = await plugin.auth.loader(async () => ({ type: "api", key: "synthetic-test-only" }))
+  const send = stream => loader.fetch("https://notion.invalid/v1/chat/completions", { method: "POST", body: JSON.stringify(body({ stream })) })
+  const good = await (await send(false)).json()
+  assert.equal(accepted.length, 1)
+  assert.deepEqual(accepted[0], good.choices[0].message)
+  bad = true
+  const response = await send(true)
+  assert.equal(response.status, 422)
+  assert.equal(accepted.length, 1)
+  assert.equal(rejected.length, 1)
+  assert.equal(rejected[0].submitted, true)
+})
+
+test("replayed tool completions retain the original client tool IDs", async () => {
+  const original = { role: "assistant", content: null, tool_calls: [{ id: "call_original", type: "function", function: { name: "Read", arguments: '{"path":"fixture.txt"}' } }] }
+  const plugin = createPlugin({
+    async open() {
+      const events = (async function* () { yield { type: "done", text: toolReply, finishReason: "stop" } })()
+      events.accept = async () => structuredClone(original)
+      return events
+    },
+  })
+  const loader = await plugin.auth.loader(async () => ({ type: "api", key: "synthetic-test-only" }))
+  for (const stream of [false, true]) {
+    const response = await loader.fetch("https://notion.invalid/v1/chat/completions", { method: "POST", body: JSON.stringify(body({ stream })) })
+    assert.equal(response.status, 200)
+    const output = await response.text()
+    assert.match(output, /call_original/)
+    assert.doesNotMatch(output, /call_[0-9a-f]{32}/)
+  }
+})
+
+test("tool policy can change without changing the thread's tool catalog identity", async () => {
+  const { send, observed } = await adapter([toolReply, envelope([], "Done")])
+  await send(body({ tool_choice: "auto" }))
+  await send(body({ tool_choice: "none" }))
+  assert.equal(observed[0].chat.bridgeContextKey, observed[1].chat.bridgeContextKey)
+  assert.deepEqual(observed[0].chat.clientMessages, body().messages)
+  assert.equal(observed[0].chat.bridgePolicy.choice, "auto")
+  assert.equal(observed[1].chat.bridgePolicy.choice, "none")
+})
+
+test("empty final tool envelopes fail without claiming a successful answer", async () => {
+  for (const stream of [false, true]) for (const text of ["", "  \n"]) {
+    const { send } = await adapter([envelope([], text)])
+    const response = await send(body({ stream }))
+    assert.equal(response.status, 422)
+    const result = await response.json()
+    assert.equal(result.error.code, "empty_answer")
+    assert.equal(result.error.retryable, false)
+    assert.equal(result.choices, undefined)
+  }
+})
+
+test("cancelling before the first stream chunk closes the prefetched upstream", async () => {
+  let closed = 0, rejected = 0
+  const plugin = createPlugin({
+    async open() {
+      const events = (async function* () {
+        try { yield { type: "text", text: "Hello" }; yield { type: "done", text: "Hello", finishReason: "stop" } }
+        finally { closed++ }
+      })()
+      events.reject = () => { rejected++ }
+      return events
+    },
+  })
+  const loader = await plugin.auth.loader(async () => ({ type: "api", key: "synthetic-test-only" }))
+  const response = await loader.fetch("https://notion.invalid/v1/chat/completions", { method: "POST", body: JSON.stringify(body({ stream: true, tools: [] })) })
+  await response.body.cancel()
+  assert.equal(closed, 1)
+  assert.equal(rejected, 1)
 })
 
 test("pre-cancelled requests never reach the model", async () => {

@@ -1,6 +1,6 @@
 {
   "name": "magpie-notion-tools",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "将 Notion AI 接入编程助手，支持文字对话、工具调用与结果回传。",
   "type": "module",
   "main": "./index.mjs",
