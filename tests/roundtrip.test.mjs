@@ -1,5 +1,8 @@
 import test, { beforeEach, afterEach } from "node:test"
 import assert from "node:assert/strict"
+import { mkdtemp, rm, realpath, readdir, readFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import protocol, { _internal } from "../protocol.mjs"
 import { createPlugin } from "../core.mjs"
 
@@ -9,15 +12,23 @@ const tools = ["Read", "Write"].map(name => ({ type: "function", function: { nam
 const envelope = (name, text = "") => JSON.stringify({ text, tool_calls: name ? [{ name, arguments: {} }] : [] })
 const messages = () => [{ role: "system", content: "SYNTHETIC_LARGE_CONTEXT_".repeat(100) }, { role: "user", content: "Read, write, then confirm." }]
 
-function reset() {
+let stateDir
+async function reset() {
   _internal.useFetch(undefined)
   _internal.catalogs.clear()
   _internal.resolved.clear()
-  _internal.sessions.clear()
-  _internal.submissions.clear()
+  await _internal.store.close()
+  if (stateDir) await rm(stateDir, { recursive: true, force: true })
+  stateDir = await mkdtemp(join(tmpdir(), "notion-roundtrip-"))
+  await _internal.store.setStateDir(stateDir)
 }
-beforeEach(reset)
-afterEach(reset)
+beforeEach(async () => reset())
+afterEach(async () => {
+  _internal.useFetch(undefined)
+  await _internal.store.close()
+  if (stateDir) await rm(stateDir, { recursive: true, force: true })
+  stateDir = undefined
+})
 
 async function fixture(replies) {
   const calls = [], writes = []
@@ -47,6 +58,45 @@ async function fixture(replies) {
   const send = (history, extra = {}) => loader.fetch("https://notion.invalid/v1/chat/completions", { method: "POST", body: JSON.stringify({ model, messages: history, tools, stream: false, ...extra }) })
   return { send, calls, writes }
 }
+
+test("usage receipts correlate restart replay without another submission", async () => {
+  const old = process.env.MAGPIE_NOTION_USAGE_DIR
+  process.env.MAGPIE_NOTION_USAGE_DIR = join(await realpath(stateDir), "usage")
+  try {
+    const { send, writes } = await fixture([envelope("Read")])
+    assert.equal((await send(messages())).status, 200)
+    await _internal.store.close()
+    await _internal.store.setStateDir(stateDir)
+    assert.equal((await send(messages())).status, 200)
+    const rows = await Promise.all((await readdir(process.env.MAGPIE_NOTION_USAGE_DIR))
+      .map(async file => JSON.parse(await readFile(join(process.env.MAGPIE_NOTION_USAGE_DIR,file),"utf8"))))
+    assert.equal(writes.length,1)
+    assert.equal(rows.filter(x=>x.event==="submission_attempt").length,1)
+    assert.equal(rows.filter(x=>x.event==="replay_completed").length,1)
+    assert.equal(new Set(rows.map(x=>x.submission)).size,1)
+    assert.equal(new Set(rows.map(x=>x.attempt)).size,2)
+    assert.ok(rows.every(x=>x.tokenUsage.status==="not_reported"))
+    assert.ok(!JSON.stringify(rows).includes("SYNTHETIC_LARGE_CONTEXT"))
+    assert.ok(!JSON.stringify(rows).includes(auth.key))
+  } finally {
+    if(old===undefined)delete process.env.MAGPIE_NOTION_USAGE_DIR
+    else process.env.MAGPIE_NOTION_USAGE_DIR=old
+  }
+})
+
+test("an unavailable usage sink cannot fail or resubmit a completed generation", async () => {
+  const old = process.env.MAGPIE_NOTION_USAGE_DIR
+  process.env.MAGPIE_NOTION_USAGE_DIR = "invalid-relative-receipt-directory"
+  try {
+    const { send, writes } = await fixture([envelope("Read")])
+    assert.equal((await send(messages())).status,200)
+    assert.equal((await send(messages())).status,200)
+    assert.equal(writes.length,1)
+  } finally {
+    if(old===undefined)delete process.env.MAGPIE_NOTION_USAGE_DIR
+    else process.env.MAGPIE_NOTION_USAGE_DIR=old
+  }
+})
 
 test("real adapter and protocol execute three tool rounds with one thread and delta-only followups", async () => {
   const { send, writes } = await fixture([envelope("Read"), envelope("Write"), envelope(null, "Verified")])
