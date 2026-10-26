@@ -18,8 +18,8 @@ test("resolved standard and select buckets survive not_applicable and hidden buc
     { bucketId: "standard", cadence: "rolling", state: "not_exposed" },
   ] })
   assert.deepEqual(windows, [
-    { name: "标准 · 0/1500", used: 0, resetsAt: new Date(periodEndMs).toISOString() },
-    { name: "精选 · 0/500", used: 0, resetsAt: new Date(periodEndMs).toISOString() },
+    { name: "标准 · 0/1500", used: 0, amount: 0, limit: 1500, unit: "credits", resetsAt: new Date(periodEndMs).toISOString() },
+    { name: "精选 · 0/500", used: 0, amount: 0, limit: 500, unit: "credits", resetsAt: new Date(periodEndMs).toISOString() },
   ])
 })
 
@@ -38,7 +38,7 @@ test("missing or malformed credit values do not become displayed zero balances",
     assert.equal(windows[0].used, 2)
   }
   assert.deepEqual(quotaWindows({ allowances: [bucket("auto", 150, 1500, { used: undefined, limit: undefined })] })[0], {
-    name: "标准 · 150/1500", used: 10, resetsAt: new Date(periodEndMs).toISOString(),
+    name: "标准 · 150/1500", used: 10, amount: 150, limit: 1500, unit: "credits", resetsAt: new Date(periodEndMs).toISOString(),
   })
 })
 

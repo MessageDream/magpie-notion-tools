@@ -27,8 +27,8 @@ function submittedTerminal(error) {
   return error?.retryable === false && ![401, 402, 403, 429].includes(error.status)
 }
 
-function errorResponse(error) {
-  const headers = {}
+function errorResponse(error, tokensUnknown = true) {
+  const headers = tokensUnknown ? { "X-Magpie-Tokens-Unknown": "true" } : {}
   if (error?.signIn === "expired") headers["X-Magpie-Sign-In"] = "expired"
   if (error?.retryAfter !== undefined) headers["Retry-After"] = error.retryAfter
   if (error?.retryable === false) headers["X-Should-Retry"] = "false"
@@ -164,11 +164,11 @@ async function* completionChunks(events, model, signal, context) {
     }
   } catch (error) {
     const failure = submittedFailure(signal.aborted ? signal.reason : error)
-    await events.reject?.(failure)
+    try { await events.reject?.(failure) } catch {}
     throw failure
   }
   const failure = submittedFailure(new ProviderError(502, "incomplete_upstream", "Notion AI ended the response without a verified completion event."))
-  await events.reject?.(failure)
+  try { await events.reject?.(failure) } catch {}
   throw failure
 }
 
@@ -201,7 +201,7 @@ function streamResponse(chunks, cancel, onCancel) {
       cancel(reason)
       try { await iterator.return?.() } finally { await onCancel?.(reason) }
     },
-  }), { headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache" } })
+  }), { headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-cache", "X-Magpie-Tokens-Unknown": "true" } })
 }
 
 // bufferedResponse answers a non-streaming request from the same event
@@ -306,7 +306,7 @@ export function createPlugin(protocol, options = {}) {
                 await acceptReply(events, completion)
                 if (chat.stream) return streamResponse(savedCompletionChunks(completion), scope.close)
                 scope.close()
-                return Response.json(completion)
+                return Response.json(completion, { headers: { "X-Magpie-Tokens-Unknown": "true" } })
               }
               // Find an upstream event before sending HTTP 200. A completed
               // empty turn can then be returned as a non-retryable HTTP error.
@@ -316,14 +316,17 @@ export function createPlugin(protocol, options = {}) {
                 await events.return?.()
               })
             } catch (error) {
+              const tokensUnknown = Boolean(events || error?.submitted)
               if (scope?.signal.aborted && scope.signal.reason instanceof ProviderError) error = scope.signal.reason
               if (events) {
                 error = submittedFailure(error)
-                await events.reject?.(error)
-                await events.return?.()
+                // Preserve the original failure if the recovery store also
+                // refuses cleanup after a failed durable write.
+                try { await events.reject?.(error) } catch {}
+                try { await events.return?.() } catch {}
               }
               scope?.close()
-              return errorResponse(error)
+              return errorResponse(error, tokensUnknown)
             }
           },
         }

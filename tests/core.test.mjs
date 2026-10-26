@@ -48,6 +48,35 @@ async function adapter(replies, options) {
   return { plugin, observed, auth, send, loader }
 }
 
+test("unknown tokens remain explicit on buffered, streamed and error replies", async () => {
+  for (const stream of [false, true]) {
+    for (const reply of ["hello", new ProviderError(429, "rate_limited", "quota", { submitted: true })]) {
+      const { send } = await adapter([reply])
+      const response = await send({ model: "test-model", messages: [{ role: "user", content: "hello" }], stream })
+      assert.equal(response.headers.get("X-Magpie-Tokens-Unknown"), "true")
+      assert.equal(response.status, reply instanceof Error ? 429 : 200)
+      await response.text()
+    }
+  }
+})
+
+test("preflight failures remain known zero without opening Notion", async () => {
+  const { send, observed } = await adapter([])
+  const response = await send({ model: "test-model", messages: [] })
+  assert.equal(response.status, 400)
+  assert.equal(response.headers.get("X-Magpie-Tokens-Unknown"), null)
+  assert.equal(observed.length, 0)
+})
+
+test("protocol validation failures do not mark unsubmitted tokens unknown", async () => {
+  for (const [status, code] of [[403, "model_unavailable"], [400, "reasoning_effort_unavailable"]]) {
+    const { send } = await adapter([new ProviderError(status, code, "Unavailable")])
+    const response = await send({ model: "test-model", messages: [{ role: "user", content: "hello" }] })
+    assert.equal(response.status, status)
+    assert.equal(response.headers.get("X-Magpie-Tokens-Unknown"), null)
+  }
+})
+
 test("full tool round trip retains arguments, result id, and the scoped account", async () => {
   const { send, observed, auth } = await adapter([toolReply, envelope([], "The file contains verified-value.")])
   const first = await (await send(body())).json()

@@ -1,5 +1,8 @@
 import test, { afterEach, beforeEach } from "node:test"
 import assert from "node:assert/strict"
+import { mkdtemp, rm, readFile, writeFile, mkdir } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import protocol, { _internal } from "../protocol.mjs"
 import { createPlugin } from "../core.mjs"
 
@@ -10,15 +13,24 @@ const messages = [{ role: "user", content: "Synthetic request" }]
 const catalog = () => Response.json({ models: [{ model, modelMessage: "Synthetic model", agentService: {} }] })
 const input = (extra = {}) => ({ auth, chat: { model, messages, ...extra }, signal: new AbortController().signal })
 
-function reset() {
+let stateDir
+async function reset() {
+  _internal.activeRequests.clear()
   _internal.useFetch(undefined)
   _internal.catalogs.clear()
   _internal.resolved.clear()
-  _internal.sessions.clear()
-  _internal.submissions.clear()
+  await _internal.store.close()
+  if (stateDir) await rm(stateDir, { recursive: true, force: true })
+  stateDir = await mkdtemp(join(tmpdir(), "notion-protocol-"))
+  await _internal.store.setStateDir(stateDir)
 }
-beforeEach(reset)
-afterEach(reset)
+beforeEach(async () => reset())
+afterEach(async () => {
+  _internal.useFetch(undefined)
+  await _internal.store.close()
+  if (stateDir) await rm(stateDir, { recursive: true, force: true })
+  stateDir = undefined
+})
 
 function intercept(handler) {
   const calls = []
@@ -153,7 +165,7 @@ test("restricted or empty catalogs do not expose Auto or fall back to a manual m
     { models: [{ ...entry, agentService: { isDisabled: true } }] },
     { models: [{ ...entry, restrictedForPersonalAgent: true }] },
   ]) {
-    reset()
+    await reset()
     const calls = intercept(endpoint => {
       if (endpoint === "authValidate") return Response.json({})
       assert.equal(endpoint, "getAvailableModels")
@@ -272,7 +284,7 @@ test("sendEventToAgentThread failures do not retry writes or create a replacemen
     ],
   })
   for (const status of [402, 429]) {
-    reset()
+    await reset()
     const calls = intercept(endpoint => {
       if (endpoint === "getAvailableModels") return catalog()
       if (endpoint === "createAgentThread") return Response.json({ threadId })
@@ -349,15 +361,15 @@ test("tool follow-ups reuse one thread and send only new results and the current
   const first = await protocol.open(toolInput(start))
   await Array.fromAsync(first)
   const accepted = acceptedTool()
-  assert.equal(first.accept(accepted), accepted)
+  assert.deepEqual(await first.accept(accepted), accepted)
   const followup = [...start, accepted, { role: "tool", tool_call_id: accepted.tool_calls[0].id, content: "NEW_VERIFIED_RESULT" }]
   const second = await protocol.open(toolInput(followup, { bridgePolicy: { choice: "none", max_calls: 1 } }))
   await Array.fromAsync(second)
   const final = { role: "assistant", content: "Verified result" }
-  second.accept(final)
+  await second.accept(final)
   const third = await protocol.open(toolInput([...followup, final, { role: "user", content: "NEXT_USER_MESSAGE" }]))
   await Array.fromAsync(third)
-  third.accept(final)
+  await third.accept(final)
   assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
   assert.equal(calls.filter(endpoint => endpoint === "sendEventToAgentThread").length, 2)
   const delta = writes[1].event.content[0].text[0][0]
@@ -382,14 +394,14 @@ test("replaying a successful tool request uses no network and preserves client c
   const first = await protocol.open(toolInput(start))
   const original = await Array.fromAsync(first)
   const accepted = acceptedTool("original-client-id")
-  first.accept(accepted)
-  first.accept(acceptedTool("must-not-replace-id"))
-  first.reject(new Error("must not erase accepted response"))
+  await first.accept(accepted)
+  await first.accept(acceptedTool("must-not-replace-id"))
+  await first.reject(new Error("must not erase accepted response"))
   const count = calls.length
   const replay = await protocol.open(toolInput(start))
   const replayed = await Array.fromAsync(replay)
   assert.equal(replayed.at(-1).text, original.at(-1).text)
-  assert.deepEqual(replay.accept(acceptedTool("regenerated-client-id")), accepted)
+  assert.deepEqual(await replay.accept(acceptedTool("regenerated-client-id")), accepted)
   assert.equal(calls.length, count)
 })
 
@@ -404,8 +416,8 @@ test("an in-flight or rejected tool request cannot submit the same generation ag
   const first = await protocol.open(request)
   await assert.rejects(() => protocol.open(request), { status: 409, code: "generation_already_submitted" })
   await Array.fromAsync(first)
-  first.reject(new Error("synthetic response validation failed"))
-  first.reject(new Error("second rejection must be harmless"))
+  await first.reject(new Error("synthetic response validation failed"))
+  await first.reject(new Error("second rejection must be harmless"))
   await assert.rejects(() => protocol.open(request), { status: 409, code: "generation_already_submitted" })
   assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
   assert.equal(_internal.sessions.size, 0)
@@ -436,7 +448,7 @@ test("tool histories without a retained matching thread fail before any write", 
 
 test("changed or busy upstream threads fail closed instead of resending client history", async () => {
   for (const state of ["busy", "changed"]) {
-    reset()
+    await reset()
     let precheck = false
     const calls = intercept(endpoint => {
       if (endpoint === "getAvailableModels") return catalog()
@@ -449,7 +461,7 @@ test("changed or busy upstream threads fail closed instead of resending client h
     const first = await protocol.open(toolInput(start))
     await Array.fromAsync(first)
     const accepted = acceptedTool()
-    first.accept(accepted)
+    await first.accept(accepted)
     precheck = true
     const next = toolInput([...start, accepted, { role: "tool", tool_call_id: accepted.tool_calls[0].id, content: "controlled result" }])
     await assert.rejects(() => protocol.open(next), { status: 409, code: state === "busy" ? "thread_busy" : "thread_history_changed" })
@@ -470,10 +482,10 @@ test("failed tool-result submission cannot be retried or branched into a fresh t
   const first = await protocol.open(toolInput(start))
   await Array.fromAsync(first)
   const accepted = acceptedTool()
-  first.accept(accepted)
+  await first.accept(accepted)
   const request = toolInput([...start, accepted, { role: "tool", tool_call_id: accepted.tool_calls[0].id, content: "Synthetic new result" }])
   await assert.rejects(() => protocol.open(request), { status: 409, code: "generation_unconfirmed", submitted: true })
-  await assert.rejects(() => protocol.open(request), { status: 409, code: "generation_already_submitted" })
+  await assert.rejects(() => protocol.open(request), error => error.submitted === true)
   assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
   assert.equal(calls.filter(endpoint => endpoint === "sendEventToAgentThread").length, 1)
 })
@@ -491,11 +503,11 @@ test("tool continuation tolerates equivalent client formatting without resending
   const first = await protocol.open(toolInput([{ role: "user", content: "Synthetic equivalent history" }]))
   await Array.fromAsync(first)
   const accepted = acceptedTool()
-  first.accept(accepted)
+  await first.accept(accepted)
   const reformatted = { tool_calls: [{ function: { arguments: '{ "path": "fixture.txt" }', name: "Read" }, type: "function", id: accepted.tool_calls[0].id }], role: "assistant", content: "", refusal: null }
   const next = await protocol.open(toolInput([{ role: "user", content: [{ type: "text", text: "Synthetic equivalent history" }] }, reformatted, { role: "tool", tool_call_id: accepted.tool_calls[0].id, content: "Synthetic equivalent result" }]))
   await Array.fromAsync(next)
-  next.accept(accepted)
+  await next.accept(accepted)
   assert.match(JSON.stringify(posted), /Synthetic equivalent result/)
   assert.doesNotMatch(JSON.stringify(posted), /SYNTHETIC_TOOL_CATALOG/)
   assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
@@ -516,13 +528,13 @@ test("parallel results for the same tool preserve IDs and original call position
   await Array.fromAsync(first)
   const accepted = acceptedTool("first-id")
   accepted.tool_calls.push({ id: "second-id", type: "function", function: { name: "Read", arguments: '{"path":"other.txt"}' } })
-  first.accept(accepted)
+  await first.accept(accepted)
   const next = await protocol.open(toolInput([...start, accepted,
     { role: "tool", tool_call_id: "second-id", content: "SECOND_RESULT" },
     { role: "tool", tool_call_id: "first-id", content: "FIRST_RESULT" },
   ]))
   await Array.fromAsync(next)
-  next.accept({ role: "assistant", content: "Done" })
+  await next.accept({ role: "assistant", content: "Done" })
   const sent = posted.event.content[0].text[0][0]
   const results = JSON.parse(sent.split("\n\n").at(-1)).tool_results
   assert.deepEqual(results, [
@@ -535,7 +547,7 @@ test("parallel results for the same tool preserve IDs and original call position
 
 test("an expired tool thread or changed catalog does not silently replay full history", async () => {
   for (const cause of ["expired", "catalog"]) {
-    reset()
+    await reset()
     const calls = intercept(endpoint => {
       if (endpoint === "getAvailableModels") return catalog()
       if (endpoint === "createAgentThread") return Response.json({ threadId })
@@ -546,7 +558,7 @@ test("an expired tool thread or changed catalog does not silently replay full hi
     const first = await protocol.open(toolInput(start))
     await Array.fromAsync(first)
     const accepted = acceptedTool()
-    first.accept(accepted)
+    await first.accept(accepted)
     if (cause === "expired") for (const value of _internal.sessions.values()) value.at = Date.now() - 31 * 60 * 1000
     const next = toolInput([...start, accepted, { role: "tool", tool_call_id: accepted.tool_calls[0].id, content: "NEW_RESULT" }], cause === "catalog" ? { bridgeContextKey: "different-catalog" } : {})
     await assert.rejects(() => protocol.open(next), { status: 409, code: "thread_history_missing" })
@@ -571,7 +583,7 @@ test("concurrent continuations cannot consume the same saved prefix twice", asyn
   const first = await protocol.open(toolInput(start))
   await Array.fromAsync(first)
   const accepted = acceptedTool()
-  first.accept(accepted)
+  await first.accept(accepted)
   const next = toolInput([...start, accepted, { role: "tool", tool_call_id: accepted.tool_calls[0].id, content: "ONE_RESULT" }])
   waiting = true
   const second = protocol.open(next)
@@ -580,7 +592,7 @@ test("concurrent continuations cannot consume the same saved prefix twice", asyn
   releaseRead()
   const events = await second
   await Array.fromAsync(events)
-  events.accept({ role: "assistant", content: "Done" })
+  await events.accept({ role: "assistant", content: "Done" })
   assert.equal(calls.filter(endpoint => endpoint === "sendEventToAgentThread").length, 1)
   assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
 })
@@ -596,6 +608,145 @@ test("an interrupted transcript cannot generate the same submitted request again
   const request = toolInput([{ role: "user", content: "Synthetic incomplete stream" }])
   const events = await protocol.open(request)
   await assert.rejects(() => Array.fromAsync(events), error => error.code === "incomplete_upstream" && error.submitted === true && error.retryable === false)
-  await assert.rejects(() => protocol.open(request), { status: 409, code: "generation_already_submitted" })
+  const recovered = await protocol.open(request)
+  await assert.rejects(() => Array.fromAsync(recovered), { code: "incomplete_upstream" })
+  assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
+})
+
+test("read429 recovers the submitted thread after reload and TTL without new generation", async () => {
+  let reads = 0
+  const calls = intercept(endpoint => {
+    if (endpoint === "getAvailableModels") return catalog()
+    if (endpoint === "createAgentThread") return Response.json({ threadId })
+    assert.equal(endpoint, "getThreadTranscript")
+    if (++reads <= 3) return Response.json({}, { status: 429, headers: { "retry-after": "0" } })
+    return completedPage(2, rawToolReply)
+  })
+  const request = toolInput([{ role: "user", content: "PRIVATE_PROMPT_MUST_NOT_BE_PERSISTED" }])
+  await assert.rejects(() => protocol.open(request), { status: 429 })
+  for (const record of _internal.submissions.values()) record.at = 0
+  await _internal.store.persist()
+  await _internal.store.setStateDir(stateDir)
+  const recovered = await protocol.open(request)
+  await Array.fromAsync(recovered)
+  const accepted = acceptedTool("durable-tool-id")
+  await recovered.accept(accepted)
+  await _internal.store.setStateDir(stateDir)
+  const replay = await protocol.open(request)
+  await Array.fromAsync(replay)
+  assert.deepEqual(await replay.accept(acceptedTool("new-id-must-not-win")), accepted)
+  assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
+  assert.equal(reads, 4)
+  const disk = await readFile(join(stateDir, "ledger.json"), "utf8")
+  assert.doesNotMatch(disk, /PRIVATE_PROMPT_MUST_NOT_BE_PERSISTED|synthetic-protocol-test-only/)
+})
+
+test("a lost create response recovers the reserved thread after restart without another write", async () => {
+  let proposed
+  const calls = intercept(async (endpoint, init) => {
+    if (endpoint === "getAvailableModels") return catalog()
+    if (endpoint === "createAgentThread") {
+      proposed = JSON.parse(init.body).threadId
+      assert.equal([..._internal.submissions.values()][0].threadId, proposed)
+      throw new TypeError("Synthetic response lost after creation")
+    }
+    assert.equal(endpoint, "getThreadTranscript")
+    assert.equal(JSON.parse(init.body).threadId, proposed)
+    return completedPage(2, rawToolReply)
+  })
+  const request = toolInput([{ role: "user", content: "Synthetic lost creation reply" }])
+  await assert.rejects(() => protocol.open(request), { submitted: true })
+  await _internal.store.setStateDir(stateDir)
+  const recovered = await protocol.open(request)
+  await Array.fromAsync(recovered)
+  await recovered.accept(acceptedTool("recovered-id"))
+  assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
+})
+
+test("corrupt durable state stops before any provider request", async () => {
+  const calls = intercept(() => { throw new Error("must not reach upstream") })
+  await _internal.store.close()
+  await writeFile(join(stateDir, "ledger.json"), "{broken")
+  await assert.rejects(() => protocol.open(input()), { code: "ledger_corrupt" })
+  assert.deepEqual(calls, [])
+})
+
+test("failed acceptance persistence never exposes uncommitted IDs in memory", async () => {
+  const calls = intercept(endpoint => {
+    if (endpoint === "getAvailableModels") return catalog()
+    if (endpoint === "createAgentThread") return Response.json({ threadId })
+    return completedPage(2, rawToolReply)
+  })
+  const request = toolInput([{ role: "user", content: "Synthetic interrupted acceptance" }])
+  const events = await protocol.open(request)
+  await Array.fromAsync(events)
+  const marker = join(stateDir, "initialized")
+  await rm(marker)
+  await mkdir(marker)
+  await assert.rejects(events.accept(acceptedTool("committed-before-sync-error")))
+  assert.equal([..._internal.submissions.values()][0].state, "pending")
+  await assert.rejects(protocol.open(request), { code: "ledger_unavailable" })
+  await rm(marker, { recursive: true })
+  await writeFile(marker, '{"version":1}')
+  await _internal.store.setStateDir(stateDir)
+  const replay = await protocol.open(request)
+  await Array.fromAsync(replay)
+  assert.equal((await replay.accept(acceptedTool("replacement-id"))).tool_calls[0].id, "committed-before-sync-error")
+  assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
+})
+
+test("the adapter returns a safe failure when acceptance cleanup also fails", async () => {
+  intercept(async endpoint => {
+    if (endpoint === "getAvailableModels") return catalog()
+    if (endpoint === "createAgentThread") return Response.json({ threadId })
+    const marker = join(stateDir, "initialized")
+    await rm(marker)
+    await mkdir(marker)
+    return completedPage(2, rawToolReply)
+  })
+  const loader = await createPlugin(protocol).auth.loader(async () => auth)
+  const response = await loader.fetch("https://notion.invalid/v1/chat/completions", { method: "POST", body: JSON.stringify({model:"auto",messages:[{role:"user",content:"Synthetic persistence failure"}]}) })
+  assert.equal(response.status, 422)
+  assert.equal((await response.json()).error.retryable, false)
+})
+
+for (const limit of ["record", "total"]) test(`accepted tool IDs survive the ${limit} replay budget`, async () => {
+  const reply = limit === "record" ? "x".repeat(1024 * 1024 + 1) : rawToolReply
+  const calls = intercept(endpoint => {
+    if (endpoint === "getAvailableModels") return catalog()
+    if (endpoint === "createAgentThread") return Response.json({ threadId })
+    return completedPage(2, reply)
+  })
+  if (limit === "total") _internal.submissions.set("b".repeat(64), {state:"completed",bytes:8*1024*1024})
+  const request = toolInput([{role:"user",content:"Synthetic cache budget " + limit}])
+  const events = await protocol.open(request)
+  await Array.fromAsync(events)
+  const accepted = acceptedTool("retained-budget-id")
+  await events.accept(accepted)
+  assert.equal((await events.accept(acceptedTool("wrong-id"))).tool_calls[0].id, "retained-budget-id")
+  await _internal.store.setStateDir(stateDir)
+  const record = [..._internal.submissions.values()].find(value => value.acceptedToolIds)
+  assert.deepEqual(record.acceptedToolIds, ["retained-budget-id"])
+  const before = calls.length
+  await assert.rejects(protocol.open(request), {code:"generation_already_submitted"})
+  assert.equal(calls.length, before)
+  assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
+})
+
+for (const status of [402, 429]) test(`upstream ${status} survives a failed failure-record write`, async () => {
+  const calls = intercept(async endpoint => {
+    if (endpoint === "getAvailableModels") return catalog()
+    assert.equal(endpoint, "createAgentThread")
+    const marker = join(stateDir, "initialized")
+    await rm(marker)
+    await mkdir(marker)
+    return Response.json({}, {status,headers:{"retry-after":"0"}})
+  })
+  const loader = await createPlugin(protocol).auth.loader(async () => auth)
+  const send = () => loader.fetch("https://notion.invalid/v1/chat/completions", {method:"POST",body:JSON.stringify({model:"auto",messages:[{role:"user",content:"Synthetic combined failure " + status}]})})
+  const first = await send()
+  assert.equal(first.status, status)
+  assert.equal((await first.json()).error.retryable, false)
+  assert.equal((await send()).status, 422)
   assert.equal(calls.filter(endpoint => endpoint === "createAgentThread").length, 1)
 })
